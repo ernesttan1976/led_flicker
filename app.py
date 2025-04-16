@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from scipy.fft import fft
 from scipy.signal import find_peaks
-from sklearn.cluster import DBSCAN
+from sklearn.metrics import mean_squared_error
 import tkinter as tk
 from tkinter import filedialog, ttk
 from PIL import Image, ImageTk
@@ -15,7 +15,7 @@ import sys
 class LEDFlickerDetector:
     def __init__(self, root):
         self.root = root
-        self.root.title("LED Flicker Frequency Detector")
+        self.root.title("LED Flicker Frequency Stability Detector")
         self.root.geometry("900x800")
         
         self.temp_dir = tempfile.mkdtemp()
@@ -27,15 +27,15 @@ class LEDFlickerDetector:
     
     def create_ui(self):
         # Title
-        title_label = tk.Label(self.root, text="LED Flicker Frequency Detector", font=("Arial", 16, "bold"))
+        title_label = tk.Label(self.root, text="LED Flicker Frequency Stability Detector", font=("Arial", 16, "bold"))
         title_label.pack(pady=10)
         
         # Instructions
         instructions = tk.Label(self.root, text=(
             "1. Click 'Browse' to select a video containing LED lights\n"
             "2. Adjust the brightness threshold if needed\n"
-            "3. Click 'Analyze' to detect LEDs with abnormal flicker patterns\n"
-            "4. LEDs with different flicker frequencies will be circled in red"
+            "3. Click 'Analyze' to detect LEDs with unstable flicker patterns\n"
+            "4. LEDs with unstable frequencies will be circled in red"
         ), justify=tk.LEFT)
         instructions.pack(pady=10)
         
@@ -64,11 +64,41 @@ class LEDFlickerDetector:
         threshold_value = tk.Label(threshold_frame, textvariable=self.threshold_var)
         threshold_value.pack(side=tk.LEFT, padx=5)
         
+        # Stability threshold frame
+        stability_frame = tk.Frame(self.root)
+        stability_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        stability_label = tk.Label(stability_frame, text="Frequency Stability Threshold (%):")
+        stability_label.pack(side=tk.LEFT, padx=5)
+        
+        self.stability_var = tk.DoubleVar(value=10.0)
+        stability_slider = ttk.Scale(stability_frame, from_=1.0, to=50.0, orient=tk.HORIZONTAL, 
+                                    variable=self.stability_var, length=300)
+        stability_slider.pack(side=tk.LEFT, padx=5)
+        
+        stability_value = tk.Label(stability_frame, textvariable=self.stability_var)
+        stability_value.pack(side=tk.LEFT, padx=5)
+        
+        # Time window size frame
+        window_frame = tk.Frame(self.root)
+        window_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        window_label = tk.Label(window_frame, text="Analysis Window Size (frames):")
+        window_label.pack(side=tk.LEFT, padx=5)
+        
+        self.window_var = tk.IntVar(value=60)
+        window_slider = ttk.Scale(window_frame, from_=20, to=120, orient=tk.HORIZONTAL, 
+                                 variable=self.window_var, length=300)
+        window_slider.pack(side=tk.LEFT, padx=5)
+        
+        window_value = tk.Label(window_frame, textvariable=self.window_var)
+        window_value.pack(side=tk.LEFT, padx=5)
+        
         # Analysis frames slider
         frames_frame = tk.Frame(self.root)
         frames_frame.pack(fill=tk.X, padx=20, pady=10)
         
-        frames_label = tk.Label(frames_frame, text="Frames to Analyze:")
+        frames_label = tk.Label(frames_frame, text="Total Frames to Analyze:")
         frames_label.pack(side=tk.LEFT, padx=5)
         
         self.frames_var = tk.IntVar(value=300)
@@ -168,10 +198,18 @@ class LEDFlickerDetector:
         """Process video in a separate thread"""
         threshold = self.threshold_var.get()
         frames_to_analyze = self.frames_var.get()
+        stability_threshold = self.stability_var.get() / 100.0  # Convert from percentage to decimal
+        window_size = self.window_var.get()
         
         try:
             # Process the video
-            message, result_image = self.detect_different_frequency_led(self.video_path, threshold, frames_to_analyze)
+            message, result_image = self.detect_frequency_stability(
+                self.video_path, 
+                threshold, 
+                frames_to_analyze,
+                window_size,
+                stability_threshold
+            )
             
             # Update UI in the main thread
             self.root.after(0, lambda: self._update_ui(message, result_image))
@@ -223,15 +261,68 @@ class LEDFlickerDetector:
                 error_msg = f"Error displaying image: {str(e)}\n{traceback.format_exc()}"
                 print(error_msg, file=sys.stderr)
                 self.status_var.set(f"Error displaying image: {str(e)}")
-                
-    def detect_different_frequency_led(self, video_path, threshold=200, max_frames=300):
+    
+    def detect_dominant_frequency(self, signal, fps):
         """
-        Analyze a video to find LEDs with different flicker frequencies.
+        Detect the dominant frequency in a signal using FFT
+        
+        Args:
+            signal: Time series signal data
+            fps: Frames per second of the video
+            
+        Returns:
+            frequency: Dominant frequency in Hz
+            amplitude: Amplitude of the dominant frequency
+        """
+        # Normalize signal
+        normalized = signal - np.mean(signal)
+        
+        # Apply smoothing to reduce noise
+        window_size = 3
+        if len(normalized) > window_size:
+            smoothed = np.convolve(normalized, np.ones(window_size)/window_size, mode='valid')
+        else:
+            smoothed = normalized
+        
+        # Apply FFT
+        n = len(smoothed)
+        if n <= 1:
+            return 0, 0
+            
+        # Compute FFT
+        fft_result = np.abs(fft(smoothed))
+        # Use only first half (positive frequencies)
+        fft_result = fft_result[1:n//2]
+        
+        # Calculate frequency axis
+        freqs = np.fft.fftfreq(n, d=1/fps)[1:n//2]
+        
+        # Find peaks in frequency domain
+        min_height = max(10, np.max(fft_result) * 0.3)
+        peaks, _ = find_peaks(fft_result, height=min_height, distance=3)
+        
+        if len(peaks) > 0:
+            # Sort peaks by amplitude
+            sorted_peaks = sorted([(freqs[i], fft_result[i]) for i in peaks], 
+                                key=lambda x: x[1], reverse=True)
+            
+            # Get the dominant frequency and its amplitude
+            dominant_freq, amplitude = sorted_peaks[0]
+            return dominant_freq, amplitude
+        else:
+            return 0, 0
+    
+    def detect_frequency_stability(self, video_path, threshold=200, max_frames=300, 
+                                 window_size=60, stability_threshold=0.1):
+        """
+        Analyze a video to find LEDs with unstable flicker frequencies.
         
         Args:
             video_path: Path to the video file
             threshold: Brightness threshold for LED detection
             max_frames: Maximum number of frames to analyze
+            window_size: Size of time windows for frequency analysis
+            stability_threshold: Maximum allowed relative standard deviation of frequency
             
         Returns:
             message: Status message
@@ -315,134 +406,130 @@ class LEDFlickerDetector:
         
         cap.release()
         
-        # Step 5: Analyze the brightness patterns for each LED
-        frequency_data = []
-        amplitude_data = []
+        # Step 5: Analyze frequency stability over time for each LED
+        stability_data = []
+        average_freq_data = []
+        stability_metrics = []
+        
+        # Calculate how many windows we'll have
+        num_windows = max(1, (frames_to_analyze - window_size) // (window_size // 2) + 1)
         
         for led_idx in range(num_leds):
             led_signal = brightness_data[led_idx]
             
-            # Normalize the signal
-            led_signal = led_signal - np.mean(led_signal)
+            # Skip processing if signal is too weak or flat
+            if np.std(led_signal) < 2.0:
+                stability_data.append(0)
+                average_freq_data.append(0)
+                stability_metrics.append(0)
+                continue
+                
+            # Analyze frequency in overlapping windows
+            window_frequencies = []
+            window_amplitudes = []
             
-            # Apply smoothing to reduce noise
-            window_size = 3
-            if len(led_signal) > window_size:
-                smoothed_signal = np.convolve(led_signal, np.ones(window_size)/window_size, mode='valid')
-            else:
-                smoothed_signal = led_signal
+            for win_idx in range(num_windows):
+                start_idx = win_idx * (window_size // 2)
+                end_idx = min(start_idx + window_size, frames_to_analyze)
+                
+                # Skip if window is too small
+                if end_idx - start_idx < window_size // 2:
+                    continue
+                    
+                window_signal = led_signal[start_idx:end_idx]
+                
+                # Calculate dominant frequency in this window
+                freq, amp = self.detect_dominant_frequency(window_signal, fps)
+                
+                # Only consider frequencies with significant amplitude
+                if freq > 0.5 and amp > 5:
+                    window_frequencies.append(freq)
+                    window_amplitudes.append(amp)
             
-            # FFT to find dominant frequency
-            n = len(smoothed_signal)
-            if n > 1:  # Check if we have enough data points
-                led_fft = np.abs(fft(smoothed_signal))
-                # Use only first half (positive frequencies)
-                led_fft = led_fft[1:n//2]
+            # Calculate stability metrics if we have enough data
+            if len(window_frequencies) >= 3:
+                avg_freq = np.mean(window_frequencies)
                 
-                # Calculate frequency axis
-                freqs = np.fft.fftfreq(n, d=1/fps)[1:n//2]
+                # Calculate coefficient of variation (relative standard deviation)
+                std_freq = np.std(window_frequencies)
+                relative_std = std_freq / avg_freq if avg_freq > 0 else 0
                 
-                # Find peaks in frequency domain
-                # Adjust height parameter based on signal strength
-                min_height = max(10, np.max(led_fft) * 0.3)
-                peaks, _ = find_peaks(led_fft, height=min_height, distance=3)
+                # Calculate mean absolute percentage deviation
+                deviations = np.abs(np.array(window_frequencies) - avg_freq) / avg_freq
+                mean_deviation = np.mean(deviations)
                 
-                if len(peaks) > 0:
-                    # Sort peaks by amplitude
-                    sorted_peaks = sorted([(freqs[i], led_fft[i]) for i in peaks], 
-                                         key=lambda x: x[1], reverse=True)
-                    
-                    # Get the dominant frequency and its amplitude
-                    dominant_freq, amplitude = sorted_peaks[0]
-                    
-                    # Store frequency in Hz and amplitude
-                    frequency_data.append(dominant_freq)
-                    amplitude_data.append(amplitude)
-                else:
-                    # No significant peaks found
-                    frequency_data.append(0)
-                    amplitude_data.append(0)
+                # Store stability metrics
+                stability_metric = max(relative_std, mean_deviation)
+                stability_data.append(stability_metric)
+                average_freq_data.append(avg_freq)
+                stability_metrics.append(stability_metric)
             else:
-                frequency_data.append(0)
-                amplitude_data.append(0)
+                # Not enough data to calculate stability
+                stability_data.append(0)
+                average_freq_data.append(0)
+                stability_metrics.append(0)
         
-        # Step 6: Identify outlier frequencies using clustering
-        # Filter out LEDs with no significant frequency
-        active_leds = [i for i, f in enumerate(frequency_data) if f > 0.5]
-        
-        if len(active_leds) < 2:
-            return "Not enough LEDs with detectable flicker patterns", display_frame
-        
-        # Get frequencies of active LEDs
-        active_frequencies = np.array([frequency_data[i] for i in active_leds]).reshape(-1, 1)
-        
-        # Use DBSCAN for clustering
-        # Epsilon value based on expected variation in frequencies (adjusted for real-world noise)
-        clustering = DBSCAN(eps=1.0, min_samples=2).fit(active_frequencies)
-        
-        # Find the majority cluster
-        labels = clustering.labels_
-        unique_labels, counts = np.unique(labels, return_counts=True)
-        
-        if len(unique_labels) == 1 and unique_labels[0] == -1:
-            # All LEDs are considered outliers, so none are different
-            outlier_leds = []
-        else:
-            # Filter out noise points (-1)
-            valid_indices = np.where(unique_labels != -1)[0]
-            if len(valid_indices) > 0:
-                valid_labels = unique_labels[valid_indices]
-                valid_counts = counts[valid_indices]
-                
-                # Find the majority cluster
-                majority_cluster = valid_labels[np.argmax(valid_counts)]
-                
-                # Identify LEDs that don't belong to the majority cluster
-                outlier_indices = np.where(labels != majority_cluster)[0]
-                outlier_leds = [active_leds[i] for i in outlier_indices]
-            else:
-                outlier_leds = []
+        # Step 6: Identify LEDs with unstable frequencies
+        unstable_leds = []
+        for i, stability in enumerate(stability_data):
+            # Check if stability metric exceeds threshold and we have a valid frequency
+            if stability > stability_threshold and average_freq_data[i] > 1.0:
+                unstable_leds.append(i)
         
         # Step 7: Create output visualization
         result_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         
         # Display frequency information for each LED
         for i, (x, y) in enumerate(led_positions):
-            freq = frequency_data[i]
-            color = (255, 0, 0) if i in outlier_leds else (0, 255, 0)
+            avg_freq = average_freq_data[i]
+            stability = stability_data[i]
             
-            # Circle size proportional to amplitude (if available)
-            if amplitude_data[i] > 0:
-                radius = max(10, min(30, int(10 + amplitude_data[i] / 100)))
+            # Determine if LED is defective (unstable)
+            is_unstable = i in unstable_leds
+            
+            if is_unstable:
+                color = (255, 0, 0)  # Red for unstable
+                variation = stability * 100  # Convert to percentage
+                radius = 20  # Larger circle for unstable LEDs
             else:
-                radius = 10
-                
+                if avg_freq > 0:
+                    color = (0, 255, 0)  # Green for stable
+                    radius = 15
+                else:
+                    color = (200, 200, 200)  # Gray for LEDs with insufficient data
+                    radius = 10
+                    
             # Draw circle around LED
             cv2.circle(result_frame, (x, y), radius, color, 2)
             
             # Add frequency label if significant
-            if freq > 0.5:
-                freq_text = f"{freq:.1f} Hz"
+            if avg_freq > 0.5:
+                freq_text = f"{avg_freq:.1f} Hz"
                 cv2.putText(result_frame, freq_text, (x-20, y-radius-5), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             
-            # Mark outliers more prominently
-            if i in outlier_leds:
-                cv2.circle(result_frame, (x, y), radius+10, (255, 0, 0), 2)
-                cv2.putText(result_frame, "DEFECTIVE", (x-40, y+radius+15), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            # Mark unstable LEDs more prominently
+            if is_unstable:
+                cv2.circle(result_frame, (x, y), radius+10, color, 2)
+                cv2.putText(result_frame, "UNSTABLE", (x-40, y+radius+15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                variation_text = f"±{variation:.1f}% variation"
+                cv2.putText(result_frame, variation_text, (x-60, y+radius+35), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         
         # Status message
-        if len(outlier_leds) > 0:
-            message = f"Found {len(outlier_leds)} LEDs with abnormal flicker frequencies"
+        if len(unstable_leds) > 0:
+            message = f"Found {len(unstable_leds)} LEDs with unstable flicker frequencies"
         else:
-            message = "All detected LEDs have similar flicker patterns"
+            message = "All detected LEDs have stable flicker patterns"
         
         # Add summary to image
         cv2.putText(result_frame, f"Analyzed {frames_to_analyze} frames at {fps:.1f} FPS", 
+                   (10, result_frame.shape[0] - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(result_frame, f"Window size: {window_size} frames, Stability threshold: {stability_threshold*100:.1f}%", 
                    (10, result_frame.shape[0] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-        cv2.putText(result_frame, f"Detected {len(led_positions)} LEDs, {len(outlier_leds)} defective", 
-                   (10, result_frame.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(result_frame, f"Detected {len(led_positions)} LEDs, {len(unstable_leds)} unstable", 
+                   (10, result_frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
         
         return message, result_frame
 
